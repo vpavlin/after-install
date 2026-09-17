@@ -45,7 +45,8 @@ die() { echo "cl: $*" >&2; exit 1; }
 
 # A name tmux and a person can both live with: no dots or colons, which tmux
 # uses to address windows and panes.
-sanitise() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\+/-/g;s/^-//;s/-$//'; }
+# -E rather than `\+`, which is a GNU extension BSD sed does not have.
+sanitise() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-' | sed -E 's/-+/-/g;s/^-//;s/-$//'; }
 
 # The registry is "name<TAB>dir", one per line. Kept because tmux only knows
 # about sessions that exist: after a reboot the names are gone, and being able
@@ -59,10 +60,14 @@ reg_names() { cut -f1 "$REGISTRY" | grep -v '^$'; }
 # parallel and getting one — and the survivor looked fine, because a session
 # still running is listed from tmux whether the registry knows it or not. The
 # loss only shows up later, when a stopped one cannot be found by name.
+# flock is util-linux and absent on macOS. Without it the registry is written
+# unlocked, which only matters when two `cl new` run in the same instant.
+lock() { command -v flock >/dev/null 2>&1 && flock "$1" || true; }
+
 reg_put() {
     local name=$1 dir=$2
     (
-        flock 9
+        lock 9
         local tmp; tmp=$(mktemp)
         awk -F'\t' -v n="$name" '$1!=n' "$REGISTRY" > "$tmp"
         printf '%s\t%s\n' "$name" "$dir" >> "$tmp"
@@ -72,7 +77,7 @@ reg_put() {
 }
 reg_del() {
     (
-        flock 9
+        lock 9
         local tmp; tmp=$(mktemp)
         awk -F'\t' -v n="$1" '$1!=n' "$REGISTRY" > "$tmp"
         mv "$tmp" "$REGISTRY"
@@ -142,6 +147,30 @@ AGENT_MESHES=${CL_AGENT_MESHES-office}
 # first probe.
 NEG_TTL=${CL_NEG_TTL:-3600}
 
+# The account to use on those hosts. Empty means ssh's own choice — the local
+# username, or whatever ~/.ssh/config says — which is right on a machine set up
+# like the others and wrong on one that is not.
+REMOTE_USER=${CL_REMOTE_USER:-}
+
+# ssh_target is host, or user@host when a remote user is set.
+ssh_target() { if [ -n "$REMOTE_USER" ]; then printf '%s@%s' "$REMOTE_USER" "$1"; else printf '%s' "$1"; fi; }
+
+# with_timeout runs a command under `timeout` where there is one.
+#
+# GNU coreutils; not on macOS, where a missing `timeout` made every probe fail
+# and every host read as having no agent. ssh's own ConnectTimeout still bounds
+# the connection without it.
+with_timeout() {
+    local secs=$1; shift
+    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+    else "$@"
+    fi
+}
+
+# mtime prints a file's modification time in epoch seconds, GNU or BSD.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+
 # mesh_peers prints "name<TAB>host" for every online peer, skipping this
 # machine. A peer on several meshes appears once.
 mesh_peers() {
@@ -164,10 +193,16 @@ def walk(o):
         for v in o:
             yield from walk(v)
 
+import socket
+
 def resolves(h):
-    return subprocess.run(["getent", "hosts", h],
-                          stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode == 0
+    # socket rather than `getent`, which does not exist on macOS — and a
+    # missing binary raised here and took every remote agent with it, silently.
+    try:
+        socket.getaddrinfo(h, None)
+        return True
+    except OSError:
+        return False
 
 import os
 wanted = set(os.environ.get("AGENT_MESHES", "").split())
@@ -184,7 +219,11 @@ for p in walk(d):
     if wanted and mesh not in wanted:
         continue
     # Offline peers are skipped here rather than timing out in ssh later.
-    if p.get("announce") not in (None, "online"):
+    #
+    # `online`, a bool. This checked `announce`, which shrooms does not emit,
+    # so the test always passed and a sleeping machine was probed every time —
+    # the negative cache hid it, while the README claimed the opposite.
+    if not p.get("online"):
         continue
     seen.add(name)
     # The QUALIFIED name first, then the short one, then the overlay address.
@@ -209,7 +248,7 @@ for p in walk(d):
 remote_agents() {
     local cache="$CACHE_DIR/agents" now
     now=$(date +%s)
-    if [ -f "$cache" ] && [ $(( now - $(stat -c %Y "$cache" 2>/dev/null || echo 0) )) -lt "$CACHE_TTL" ]; then
+    if [ -f "$cache" ] && [ $(( now - $(mtime "$cache") )) -lt "$CACHE_TTL" ]; then
         cat "$cache"
         return
     fi
@@ -226,8 +265,8 @@ remote_agents() {
             continue
         fi
         (
-            if timeout 8 ssh -o BatchMode=yes -o ConnectTimeout=4 \
-                 -o StrictHostKeyChecking=accept-new "$host" \
+            if with_timeout 8 ssh -o BatchMode=yes -o ConnectTimeout=4 \
+                 -o StrictHostKeyChecking=accept-new "$(ssh_target "$host")" \
                  "tmux has-session -t '$REMOTE_SESSION'" >/dev/null 2>&1; then
                 printf '%s\t%s\n' "$name" "$host" > "$tmp/$name"
             else
@@ -347,7 +386,7 @@ attach() {
     # Deliberately does not start anything. These sessions are somebody else's
     # to run; `cl` reaches them, it does not manage them.
     if host=$(remote_host_for "$name"); then
-        exec ssh -t -o StrictHostKeyChecking=accept-new "$host" \
+        exec ssh -t -o StrictHostKeyChecking=accept-new "$(ssh_target "$host")" \
             "tmux attach -d -t '$REMOTE_SESSION'"
     fi
 
