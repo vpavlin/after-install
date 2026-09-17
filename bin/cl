@@ -245,6 +245,27 @@ for p in walk(d):
 # this, and a person typing it twice should not wait twice. BatchMode so a host
 # that wants a password is skipped rather than hanging on a prompt nobody can
 # see when this is running inside a list.
+# Machines that have ever run an agent, kept across runs: "name<TAB>host".
+#
+# In the config directory rather than the cache, because it is knowledge rather
+# than a shortcut — it is what lets a stopped agent be listed as stopped instead
+# of vanishing. Killing scribe's agent used to remove scribe from the list, and
+# then the negative cache hid it for an hour after it was started again.
+AGENT_HOSTS=${CL_AGENT_HOSTS:-$HOME/.config/cl/agents}
+
+# remote_agents prints "name<TAB>host<TAB>state" for every known agent machine
+# and every online one currently running an agent.
+#
+# state is one of:
+#   up        the session is running
+#   stopped   the machine answers and the session is not there
+#   no-ssh    the machine is on the mesh and would not take an SSH connection
+#   offline   the machine has run an agent before and is not on the mesh now
+#
+# Probed in parallel and cached for a few seconds: `cl` with no argument runs
+# this, and a person typing it twice should not wait twice. BatchMode so a host
+# that wants a password is skipped rather than hanging on a prompt nobody can
+# see when this is running inside a list.
 remote_agents() {
     local cache="$CACHE_DIR/agents" now
     now=$(date +%s)
@@ -252,29 +273,65 @@ remote_agents() {
         cat "$cache"
         return
     fi
-    mkdir -p "$CACHE_DIR"
+    mkdir -p "$CACHE_DIR" "$(dirname "$AGENT_HOSTS")"
+    touch "$AGENT_HOSTS"
     local tmp; tmp=$(mktemp -d)
     local neg="$CACHE_DIR/not-agents"
     touch "$neg"
-    local name host seen_at
+    local name host seen_at known
     while IFS=$'\t' read -r name host; do
         [ -n "$host" ] || continue
-        # Skip a host recently found not to be running one.
-        seen_at=$(awk -F'\t' -v h="$host" '$1==h{print $2}' "$neg" | tail -1)
-        if [ -n "$seen_at" ] && [ $(( now - seen_at )) -lt "$NEG_TTL" ]; then
-            continue
+        : > "$tmp/.seen.$name"
+        known=$(awk -F'\t' -v n="$name" '$1==n{print "y"; exit}' "$AGENT_HOSTS")
+        # The negative cache is for machines that have never run an agent. A
+        # known one is always asked, or a restarted agent stays hidden for an
+        # hour — which is exactly what happened.
+        if [ -z "$known" ]; then
+            seen_at=$(awk -F'\t' -v h="$host" '$1==h{print $2}' "$neg" | tail -1)
+            if [ -n "$seen_at" ] && [ $(( now - seen_at )) -lt "$NEG_TTL" ]; then
+                continue
+            fi
         fi
         (
-            if with_timeout 8 ssh -o BatchMode=yes -o ConnectTimeout=4 \
-                 -o StrictHostKeyChecking=accept-new "$(ssh_target "$host")" \
-                 "tmux has-session -t '$REMOTE_SESSION'" >/dev/null 2>&1; then
-                printf '%s\t%s\n' "$name" "$host" > "$tmp/$name"
-            else
-                printf '%s\t%s\n' "$host" "$now" > "$tmp/.neg.$name"
-            fi
+            with_timeout 8 ssh -o BatchMode=yes -o ConnectTimeout=4 \
+                -o StrictHostKeyChecking=accept-new "$(ssh_target "$host")" \
+                "tmux has-session -t '$REMOTE_SESSION'" >/dev/null 2>&1
+            # 0: running. 1: tmux answered and has no such session. Anything
+            # else — 255 from ssh, 127 for no tmux, 124 from timeout — means we
+            # could not ask at all.
+            case $? in
+                0) printf '%s\t%s\tup\n' "$name" "$host" > "$tmp/$name"
+                   printf '%s\t%s\n' "$name" "$host" > "$tmp/.known.$name" ;;
+                1) if [ -n "$known" ]; then
+                       printf '%s\t%s\tstopped\n' "$name" "$host" > "$tmp/$name"
+                   else
+                       printf '%s\t%s\n' "$host" "$now" > "$tmp/.neg.$name"
+                   fi ;;
+                *) if [ -n "$known" ]; then
+                       printf '%s\t%s\tno-ssh\n' "$name" "$host" > "$tmp/$name"
+                   else
+                       printf '%s\t%s\n' "$host" "$now" > "$tmp/.neg.$name"
+                   fi ;;
+            esac
         ) &
     done < <(mesh_peers)
     wait
+
+    # Known machines the mesh did not offer at all are offline, and listed as
+    # such rather than dropped: a machine that is asleep is still one you have.
+    while IFS=$'\t' read -r name host; do
+        [ -n "$name" ] || continue
+        [ -e "$tmp/.seen.$name" ] && continue
+        printf '%s\t%s\toffline\n' "$name" "$host" > "$tmp/$name"
+    done < "$AGENT_HOSTS"
+
+    # Remember newly seen agent machines, and keep the address current.
+    {
+        cat "$tmp"/.known.* 2>/dev/null
+        awk -F'\t' 'NF>=2' "$AGENT_HOSTS"
+    } | awk -F'\t' '!seen[$1]++' | sort > "$AGENT_HOSTS.tmp" \
+        && mv "$AGENT_HOSTS.tmp" "$AGENT_HOSTS"
+
     # Fold new negatives in, dropping expired ones so the file cannot grow
     # without bound. Written through a temp file and a rename so two `cl` calls
     # at once cannot leave it half-written.
@@ -282,10 +339,16 @@ remote_agents() {
         awk -F'\t' -v now="$now" -v ttl="$NEG_TTL" 'now-$2 < ttl' "$neg"
         cat "$tmp"/.neg.* 2>/dev/null
     } | sort -u -k1,1 > "$neg.tmp" && mv "$neg.tmp" "$neg"
-    rm -f "$tmp"/.neg.*
+
+    rm -f "$tmp"/.neg.* "$tmp"/.known.* "$tmp"/.seen.*
     cat "$tmp"/* 2>/dev/null | sort > "$cache"
     rm -rf "$tmp"
     cat "$cache"
+}
+
+# remote_state_for prints a remote agent's state, as remote_agents reports it.
+remote_state_for() {
+    remote_agents | awk -F'\t' -v n="$1" '$1==n{print $3; exit}'
 }
 
 remote_names() { remote_agents | cut -f1; }
@@ -337,7 +400,10 @@ list() {
         # session here. Its uptime would cost another round trip per host, and
         # the answer to "is it there" is the part worth waiting for.
         if host=$(remote_host_for "$name"); then
-            printf '  %-3s %-18s %-9s %s\n' "$n" "$name" "agent" "$host"
+            local rs
+            rs=$(remote_state_for "$name")
+            [ "$rs" = up ] && rs=agent
+            printf '  %-3s %-18s %-9s %s\n' "$n" "$name" "$rs" "$host"
             continue
         fi
         if running "$name"; then
@@ -405,6 +471,12 @@ attach() {
     # Deliberately does not start anything. These sessions are somebody else's
     # to run; `cl` reaches them, it does not manage them.
     if host=$(remote_host_for "$name"); then
+        case "$(remote_state_for "$name")" in
+            up) ;;
+            stopped) die "the agent on $name is not running — start it there" ;;
+            offline) die "$name is not on the mesh right now" ;;
+            *)       die "$name is on the mesh but would not take an SSH connection" ;;
+        esac
         set_title "$name · $REMOTE_SESSION"
         exec ssh -t -o StrictHostKeyChecking=accept-new "$(ssh_target "$host")" \
             "tmux attach -d -t '$REMOTE_SESSION'"
@@ -449,6 +521,12 @@ case "$cmd" in
         [ $# -ge 2 ] || die "which one?"
         name=$(resolve "$2")
         reg_del "$name"
+        # A retired agent machine would otherwise be listed as offline forever.
+        if [ -f "$AGENT_HOSTS" ]; then
+            awk -F'\t' -v n="$name" '$1!=n' "$AGENT_HOSTS" > "$AGENT_HOSTS.tmp" \
+                && mv "$AGENT_HOSTS.tmp" "$AGENT_HOSTS"
+            rm -f "$CACHE_DIR/agents"
+        fi
         echo "forgot $name"
         ;;
 

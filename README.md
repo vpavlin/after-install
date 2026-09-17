@@ -38,10 +38,18 @@ is skipped without waiting on a timeout.
 | `CL_REMOTE_SESSION` | `pi-agent` | the tmux session name on those hosts |
 | `CL_REMOTE_USER` | *(ssh's choice)* | account on those hosts, when it differs from yours |
 | `CL_CACHE_TTL` | `20` | seconds a list of agents is reused |
-| `CL_NEG_TTL` | `3600` | seconds a host without an agent is left alone |
+| `CL_NEG_TTL` | `3600` | seconds a machine that never ran an agent is left alone |
+| `CL_AGENT_HOSTS` | `~/.config/cl/agents` | machines known to run one |
 
-A host newly running an agent can take up to `CL_NEG_TTL` to appear if it was
-recently found without one; `rm ~/.cache/cl/not-agents` forces a re-check.
+Machines that have run an agent are remembered in `~/.config/cl/agents`, so an
+agent you stop is listed as **stopped** rather than disappearing, and one that
+is asleep is listed as **offline**. `cl <host>` on either says so instead of
+attaching. `cl rm <host>` forgets a machine you have retired.
+
+A machine that has *never* run an agent is left alone for `CL_NEG_TTL` after it
+is found without one — that is what keeps a phone with no sshd from slowing the
+list down. If you start the first agent on such a machine, `rm
+~/.cache/cl/not-agents` makes it appear straight away.
 
 Needs `bash` and `tmux`, and — for remote agents — `shrooms`, `python3` and SSH
 keys on the peers.
