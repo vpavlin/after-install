@@ -373,6 +373,25 @@ start() {
         "$CLAUDE $CLAUDE_ARGS $(continue_flag "$dir")"
 }
 
+# set_title names the terminal tab.
+#
+# A local session gets its title from this machine's tmux (set-titles in
+# ~/.tmux.conf). An agent on another machine is attached by ITS tmux, where
+# set-titles is off by default — so nothing named the tab, and several agents
+# open at once were indistinguishable. Set here, just before handing over to
+# ssh: a remote tmux that leaves titles alone leaves this one in place for the
+# whole session, and one that sets its own simply replaces it.
+#
+# The host goes first because it is the part that differs; every agent's
+# session has the same name. Written to the terminal rather than stdout so a
+# redirected `cl` cannot put an escape sequence in a file.
+set_title() {
+    # Braces, because a failed redirect is reported by the shell before
+    # printf's own 2> exists — and /dev/tty passes -w even with no controlling
+    # terminal, then refuses to open.
+    { printf '\033]0;%s\007' "$1" > /dev/tty; } 2>/dev/null || true
+}
+
 attach() {
     local name=$1 dir host
 
@@ -386,6 +405,7 @@ attach() {
     # Deliberately does not start anything. These sessions are somebody else's
     # to run; `cl` reaches them, it does not manage them.
     if host=$(remote_host_for "$name"); then
+        set_title "$name · $REMOTE_SESSION"
         exec ssh -t -o StrictHostKeyChecking=accept-new "$(ssh_target "$host")" \
             "tmux attach -d -t '$REMOTE_SESSION'"
     fi
