@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+# cl — several Claudes, one per directory, reachable from a phone.
+#
+# Generalises the single `claude` tmux session that came before it. The three
+# decisions in that setup were right and are kept:
+#
+#   --continue resumes the last conversation FOR THE WORKING DIRECTORY, so the
+#   directory a session starts in is the thing that decides which history it
+#   picks up. That is why sessions are keyed by directory here rather than by
+#   name alone.
+#
+#   -A -D on attach, so a phone taking over from a laptop does not fight it for
+#   the terminal size — the laptop is detached rather than left resizing.
+#
+#   A command rather than an alias, so it works from a local terminal and not
+#   only over SSH.
+#
+# What it adds is a registry, so a session can be named, listed, and brought
+# back in the right directory after a reboot has taken the tmux server with it.
+#
+# Usage:
+#   cl                    list; attach when there is exactly one
+#   cl <name|number>      attach, starting it if it is not running
+#   cl new [dir] [name]   start one for a directory (default: here)
+#   cl ls                 list
+#   cl kill <name|number> stop one
+#   cl rm <name>          forget one (does not stop it)
+
+set -uo pipefail
+
+PREFIX=${CL_PREFIX:-cl}
+REGISTRY=${CL_REGISTRY:-$HOME/.config/cl/sessions}
+# The binary and its arguments, both overridable — CL_CLAUDE so the plumbing
+# can be exercised without starting real conversations, CL_CLAUDE_ARGS so the
+# permission mode is a setting rather than something baked in here.
+CLAUDE=${CL_CLAUDE:-claude}
+# --continue is NOT in here: it is added per directory below, because passing it
+# where there is nothing to continue is fatal rather than ignored.
+CLAUDE_ARGS=${CL_CLAUDE_ARGS:---dangerously-skip-permissions}
+
+mkdir -p "$(dirname "$REGISTRY")"
+touch "$REGISTRY"
+
+die() { echo "cl: $*" >&2; exit 1; }
+
+# A name tmux and a person can both live with: no dots or colons, which tmux
+# uses to address windows and panes.
+sanitise() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\+/-/g;s/^-//;s/-$//'; }
+
+# The registry is "name<TAB>dir", one per line. Kept because tmux only knows
+# about sessions that exist: after a reboot the names are gone, and being able
+# to type `cl loam` and land in the right directory is the whole point.
+reg_dir()  { awk -F'\t' -v n="$1" '$1==n{print $2; exit}' "$REGISTRY"; }
+reg_names() { cut -f1 "$REGISTRY" | grep -v '^$'; }
+# Both mutations are read-modify-write, so both take a lock.
+#
+# Without it, starting two at once loses one: each reads the file, each writes
+# its own copy back, and the second mv wins. Found by creating three in
+# parallel and getting one — and the survivor looked fine, because a session
+# still running is listed from tmux whether the registry knows it or not. The
+# loss only shows up later, when a stopped one cannot be found by name.
+reg_put() {
+    local name=$1 dir=$2
+    (
+        flock 9
+        local tmp; tmp=$(mktemp)
+        awk -F'\t' -v n="$name" '$1!=n' "$REGISTRY" > "$tmp"
+        printf '%s\t%s\n' "$name" "$dir" >> "$tmp"
+        sort -o "$tmp" "$tmp"
+        mv "$tmp" "$REGISTRY"
+    ) 9>>"$REGISTRY.lock"
+}
+reg_del() {
+    (
+        flock 9
+        local tmp; tmp=$(mktemp)
+        awk -F'\t' -v n="$1" '$1!=n' "$REGISTRY" > "$tmp"
+        mv "$tmp" "$REGISTRY"
+    ) 9>>"$REGISTRY.lock"
+}
+
+running() { tmux has-session -t "$PREFIX-$1" 2>/dev/null; }
+
+# --continue, but only where there is a conversation to continue.
+#
+# In a directory Claude Code has never been opened in, `claude --continue` does
+# not start and fall back — it prints "No conversation found to continue" and
+# exits 1. Inside tmux that is a session that appears and vanishes, which reads
+# as `cl new` being broken.
+#
+# Transcripts live in ~/.claude/projects, keyed by the working directory with
+# every / and . turned into -. That is an internal layout and may change, so
+# this is written to degrade the safe way: if the directory is not found, the
+# flag is simply not passed, and the worst case is a fresh conversation in a
+# directory that had one rather than a session that will not start.
+continue_flag() {
+    local key
+    key=$(printf '%s' "$1" | tr '/.' '-')
+    compgen -G "$HOME/.claude/projects/$key/*.jsonl" >/dev/null 2>&1 && printf -- '--continue'
+}
+
+# Seconds as something readable at a glance. The point of the column is "is
+# this one busy or has it been sitting for two days", so it stops at days.
+ago() {
+    local s=$1
+    if   [ "$s" -lt 60 ]    ; then printf '%ds' "$s"
+    elif [ "$s" -lt 3600 ]  ; then printf '%dm' $((s/60))
+    elif [ "$s" -lt 86400 ] ; then printf '%dh' $((s/3600))
+    else                           printf '%dd' $((s/86400))
+    fi
+}
+
+# --- agents on other machines -------------------------------------------
+#
+# The office machines run their own agent in tmux, and reaching one meant
+# remembering which host it was on and typing two commands. They are peers on
+# the mesh, so `cl` can just know.
+#
+# Hosts come from the mesh rather than a config file, and that is the whole
+# trick: `shrooms status` already knows every peer, which mesh it is on, and
+# whether it is ONLINE. So a machine that is asleep is skipped without waiting
+# for an ssh timeout, and one that joins appears here with nothing to edit.
+REMOTE_SESSION=${CL_REMOTE_SESSION:-pi-agent}
+CACHE_DIR=${CL_CACHE:-$HOME/.cache/cl}
+CACHE_TTL=${CL_CACHE_TTL:-20}
+
+# Only these meshes are searched for agents. Space-separated; empty searches
+# all of them.
+#
+# Not all of them by default, because the list is as slow as its slowest host
+# and the slow hosts were never going to answer: measured 2026-09-17, a phone
+# with no sshd took 3.1s to fail, k11 3.2s through the relay, vps 2.1s refusing
+# the key — while the four actual agents answered in 0.2-0.3s. Every one of the
+# slow three is on a mesh the agents are not on.
+AGENT_MESHES=${CL_AGENT_MESHES-office}
+
+# How long a host that is NOT running an agent is left alone.
+#
+# Much longer than the positive cache, because that is the answer that does not
+# change: a phone does not grow an sshd between two `cl` calls. The phone is on
+# office too, so the mesh filter alone does not spare it — this does, after the
+# first probe.
+NEG_TTL=${CL_NEG_TTL:-3600}
+
+# mesh_peers prints "name<TAB>host" for every online peer, skipping this
+# machine. A peer on several meshes appears once.
+mesh_peers() {
+    command -v shrooms >/dev/null 2>&1 || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    shrooms status --json 2>/dev/null | AGENT_MESHES="$AGENT_MESHES" python3 -c '
+import json, sys, subprocess
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+
+def walk(o):
+    if isinstance(o, dict):
+        if o.get("overlay") and o.get("name"):
+            yield o
+        for v in o.values():
+            yield from walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk(v)
+
+def resolves(h):
+    return subprocess.run(["getent", "hosts", h],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+import os
+wanted = set(os.environ.get("AGENT_MESHES", "").split())
+
+seen = set()
+for p in walk(d):
+    name, mesh = p.get("name"), p.get("mesh")
+    if not name or name in seen:
+        continue
+    # This machine. Its own entry carries no mesh, and probing it cost a
+    # round trip to learn that we are not running a pi agent here.
+    if not mesh:
+        continue
+    if wanted and mesh not in wanted:
+        continue
+    # Offline peers are skipped here rather than timing out in ssh later.
+    if p.get("announce") not in (None, "online"):
+        continue
+    seen.add(name)
+    # The QUALIFIED name first, then the short one, then the overlay address.
+    #
+    # The short name means "this peer on my PRIMARY mesh", which is not
+    # necessarily the mesh we found it online on. jimmy-crib on 2026-09-16 was
+    # online on office and stale on default; jimmy-crib.mesh resolved happily
+    # to the dead one, and ssh sat there until it timed out. Resolving is not
+    # reachability, and the qualified name says which mesh we mean.
+    host = next((h for h in (f"{name}.{mesh}.mesh", f"{name}.mesh") if resolves(h)),
+                p["overlay"])
+    print(f"{name}\t{host}")
+' 2>/dev/null
+}
+
+# remote_agents prints "name<TAB>host" for peers actually running an agent.
+#
+# Probed in parallel and cached for a few seconds: `cl` with no argument runs
+# this, and a person typing it twice should not wait twice. BatchMode so a host
+# that wants a password is skipped rather than hanging on a prompt nobody can
+# see when this is running inside a list.
+remote_agents() {
+    local cache="$CACHE_DIR/agents" now
+    now=$(date +%s)
+    if [ -f "$cache" ] && [ $(( now - $(stat -c %Y "$cache" 2>/dev/null || echo 0) )) -lt "$CACHE_TTL" ]; then
+        cat "$cache"
+        return
+    fi
+    mkdir -p "$CACHE_DIR"
+    local tmp; tmp=$(mktemp -d)
+    local neg="$CACHE_DIR/not-agents"
+    touch "$neg"
+    local name host seen_at
+    while IFS=$'\t' read -r name host; do
+        [ -n "$host" ] || continue
+        # Skip a host recently found not to be running one.
+        seen_at=$(awk -F'\t' -v h="$host" '$1==h{print $2}' "$neg" | tail -1)
+        if [ -n "$seen_at" ] && [ $(( now - seen_at )) -lt "$NEG_TTL" ]; then
+            continue
+        fi
+        (
+            if timeout 8 ssh -o BatchMode=yes -o ConnectTimeout=4 \
+                 -o StrictHostKeyChecking=accept-new "$host" \
+                 "tmux has-session -t '$REMOTE_SESSION'" >/dev/null 2>&1; then
+                printf '%s\t%s\n' "$name" "$host" > "$tmp/$name"
+            else
+                printf '%s\t%s\n' "$host" "$now" > "$tmp/.neg.$name"
+            fi
+        ) &
+    done < <(mesh_peers)
+    wait
+    # Fold new negatives in, dropping expired ones so the file cannot grow
+    # without bound. Written through a temp file and a rename so two `cl` calls
+    # at once cannot leave it half-written.
+    {
+        awk -F'\t' -v now="$now" -v ttl="$NEG_TTL" 'now-$2 < ttl' "$neg"
+        cat "$tmp"/.neg.* 2>/dev/null
+    } | sort -u -k1,1 > "$neg.tmp" && mv "$neg.tmp" "$neg"
+    rm -f "$tmp"/.neg.*
+    cat "$tmp"/* 2>/dev/null | sort > "$cache"
+    rm -rf "$tmp"
+    cat "$cache"
+}
+
+remote_names() { remote_agents | cut -f1; }
+
+# remote_host_for prints the host for a remote name, or nothing if it is local.
+#
+# Local names win a collision, because a local session is the one you can start
+# and stop from here. A remote shadowed that way is still reachable by number.
+remote_host_for() {
+    local want=$1
+    local_names | grep -qxF "$want" && return 1
+    remote_agents | awk -F'\t' -v n="$want" '$1==n{print $2; found=1} END{exit !found}'
+}
+
+# local_names is what all_names used to be: registered, plus any running
+# session started by hand.
+local_names() {
+    { reg_names
+      tmux ls -F '#{session_name}' 2>/dev/null | sed -n "s/^$PREFIX-//p"
+    } | sort -u | grep -v '^$'
+}
+
+# Every name we know about, local first so the numbers people learn stay put
+# when a remote machine comes and goes.
+all_names() {
+    { local_names; remote_names; } | grep -v '^$'
+}
+
+# Resolve "3" or "loam" to a name. Numbers index the list as printed, because
+# on a phone a number is much easier to type than a path-derived name.
+resolve() {
+    local want=$1
+    if [[ $want =~ ^[0-9]+$ ]]; then
+        all_names | sed -n "${want}p"
+        return
+    fi
+    printf '%s' "$want"
+}
+
+list() {
+    local names n=0
+    names=$(all_names)
+    [ -n "$names" ] || { echo "no claudes yet — start one with: cl new"; return; }
+    printf '  %-3s %-18s %-9s %s\n' '#' 'NAME' 'STATE' 'WHERE'
+    while IFS= read -r name; do
+        n=$((n+1))
+        local state dir host
+        # A remote agent first, since it is neither registered nor a tmux
+        # session here. Its uptime would cost another round trip per host, and
+        # the answer to "is it there" is the part worth waiting for.
+        if host=$(remote_host_for "$name"); then
+            printf '  %-3s %-18s %-9s %s\n' "$n" "$name" "agent" "$host"
+            continue
+        fi
+        if running "$name"; then
+            # Idle time from tmux's own activity clock, formatted here.
+            # #{t/relative:...} exists but prints an absolute date on 3.5a, so
+            # the epoch is asked for and the arithmetic done where it can be
+            # seen.
+            local since now
+            since=$(tmux display -p -t "$PREFIX-$name" '#{session_activity}' 2>/dev/null)
+            now=$(date +%s)
+            state="up $(ago $(( now - ${since:-$now} )))"
+            dir=$(tmux display -p -t "$PREFIX-$name" '#{pane_current_path}' 2>/dev/null)
+        else
+            state="stopped"
+            dir=$(reg_dir "$name")
+        fi
+        # $HOME quoted inside the pattern: unquoted, the anchored replacement
+        # silently does not match and every row prints the full path, which is
+        # what this was doing. Worth the character on a phone-width terminal.
+        printf '  %-3s %-18s %-9s %s\n' "$n" "$name" "$state" "${dir/#"$HOME"/\~}"
+    done <<< "$names"
+}
+
+start() {
+    local dir=$1 name=$2
+    [ -d "$dir" ] || die "no directory at $dir"
+    dir=$(cd "$dir" && pwd)
+    reg_put "$name" "$dir"
+    running "$name" && return 0
+    # Detached, so this works the same whether it is being created to attach to
+    # now or warmed up in the background.
+    tmux new-session -d -s "$PREFIX-$name" -c "$dir" \
+        "$CLAUDE $CLAUDE_ARGS $(continue_flag "$dir")"
+}
+
+attach() {
+    local name=$1 dir host
+
+    # An agent on another machine: ssh in and attach to it there.
+    #
+    # -t because tmux needs a terminal and ssh only allocates one when asked.
+    # -d for the same reason as locally — a phone taking over should detach the
+    # laptop rather than negotiate a shared size with it, which leaves both
+    # with the smaller one.
+    #
+    # Deliberately does not start anything. These sessions are somebody else's
+    # to run; `cl` reaches them, it does not manage them.
+    if host=$(remote_host_for "$name"); then
+        exec ssh -t -o StrictHostKeyChecking=accept-new "$host" \
+            "tmux attach -d -t '$REMOTE_SESSION'"
+    fi
+
+    dir=$(reg_dir "$name")
+    if ! running "$name"; then
+        [ -n "$dir" ] || die "no claude called '$name' — 'cl ls' to see them"
+        start "$dir" "$name"
+    fi
+    # -D detaches whoever else is attached: the phone and the laptop otherwise
+    # negotiate a shared size, which means the smaller one wins and the laptop
+    # is left with a phone-shaped window.
+    exec tmux attach -d -t "$PREFIX-$name"
+}
+
+cmd=${1:-}
+case "$cmd" in
+    ls|list) list ;;
+
+    new)
+        dir=${2:-$PWD}
+        [ -d "$dir" ] || die "no directory at $dir"
+        name=${3:-$(sanitise "$(basename "$(cd "$dir" && pwd)")")}
+        start "$dir" "$name"
+        attach "$name"
+        ;;
+
+    kill|stop)
+        [ $# -ge 2 ] || die "which one? 'cl ls' to see them"
+        name=$(resolve "$2")
+        [ -n "$name" ] || die "no such claude"
+        if remote_host_for "$name" >/dev/null; then
+            die "'$name' is an agent on another machine — stop it there"
+        fi
+        running "$name" || die "'$name' is not running"
+        tmux kill-session -t "$PREFIX-$name"
+        echo "stopped $name (still registered — 'cl $name' starts it again)"
+        ;;
+
+    rm|forget)
+        [ $# -ge 2 ] || die "which one?"
+        name=$(resolve "$2")
+        reg_del "$name"
+        echo "forgot $name"
+        ;;
+
+    -h|--help|help)
+        sed -n '2,30p' "$0" | sed 's/^# \?//'
+        ;;
+
+    "")
+        # No argument. One claude is unambiguous, so go straight there; several
+        # means show the list and let a number be typed, which is the whole
+        # reason numbers are accepted.
+        names=$(all_names)
+        count=$(printf '%s' "$names" | grep -c . || true)
+        case "$count" in
+            0) echo "no claudes yet. Start one here with:  cl new" ;;
+            1) attach "$names" ;;
+            *) list; echo; echo "attach with:  cl <#>" ;;
+        esac
+        ;;
+
+    *)
+        name=$(resolve "$cmd")
+        [ -n "$name" ] || die "no claude '$cmd' — 'cl ls' to see them"
+        attach "$name"
+        ;;
+esac
